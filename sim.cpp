@@ -39,7 +39,7 @@ int main()
         {
             int flow_id = gen_flow_id();
             if (flow_id == -1)
-                break;
+                flow_id = rand() % (9 - 1) + 1;
             double size = (double)((rand() % (300 - 50 + 1)) + 50) + (double)(1.0 / (double)rand());
             test_packets[i].arrival_time = num_cycles;
             test_packets[i].size = size;

@@ -16,3 +16,15 @@
 2.A,B,C,D区域还没有引入bitmap，采用的是FIFO的方式，而且有漏洞
 
 3.区域参数化
+
+### 构造流量
+
+1.预设了64条flow所属的类型{持续活跃流，频繁退出流，突发发包流，间歇性流}
+
+2.main函数的while循环的每个cycle都会update一次flow的state(不同类型流的updata方式不同)
+
+3.每个cycle会随机生成2-30个enqueue包
+
+4.按照类型权重，选择一条被激活的指定类型flow，作为一个enqueue包的所属流
+
+5.以上逻辑循环enqueue_num次
