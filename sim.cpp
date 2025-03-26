@@ -4,6 +4,7 @@ int main()
 {
     // 1.初始化阶段
     q->size = 0; // 硬件堆中现有0个包
+    long long sum_packets = 0;
     srand(time(0));
     manage_metadata.Δ1 = 50.0, manage_metadata.Δ2 = 100.0, manage_metadata.Δ3 = 150.0, manage_metadata.Δ4 = 300.0; // 初始化Δ
     initialize_memory();                                                                                           // 初始化SRAM和DRAM
@@ -32,6 +33,8 @@ int main()
         // 1.生成入包数量/出包数量
         int num_enqueue = gen_num_enqueue_packets();
         int num_dequeue = gen_num_dequeue_packets();
+        sum_packets += num_dequeue;
+        double middle_rank;
         cout << "Cycle" << num_cycles_bak - num_cycles - 1 << ": " << "Enqueue_Num:" << num_enqueue << ' ' << "Dequeue_Num:" << num_dequeue << endl;
         //  1-1.创建测试数据包
         Packet *test_packets = (Packet *)malloc(sizeof(Packet) * num_enqueue);
@@ -53,19 +56,28 @@ int main()
         // 2.根据所选调度算法类型调用，例如wfq-pre-enqueue(内部调用enqueue_ram)
         if (SCHEDULER_TYPE == WFQ)
         {
-            wfq_pre_enqueue(packets, num_enqueue);
+            wfq_pre_enqueue(packets, num_enqueue, &middle_rank);
         }
-        if (max_rank > manage_metadata.Δ2 + 50)
+
+        if (SLIDE_WINDOW_TYPE == NORMAL)
         {
-            if (SLIDE_WINDOW_TYPE == NORMAL)
+            if (max_rank > manage_metadata.Δ2 + 50)
             {
                 slide_window_normal(max_rank);
             }
-            else if (SLIDE_WINDOW_TYPE == GROWTH_FACTOR)
+        }
+        else if (SLIDE_WINDOW_TYPE == GROWTH_FACTOR)
+        {
+            slide_window_growth(max_rank, middle_rank);
+        }
+        else if (SLIDE_WINDOW_TYPE == STATICTICS)
+        {
+            if (max_rank > manage_metadata.Δ4 + 100)
             {
-                slide_window_growth(max_rank);
+                slide_window_statistics(middle_rank, max_rank);
             }
         }
+
         // 3.出包处理
         //  3-1.wfq-post-dequeue
         //  3-2.dequeue-ram
@@ -90,5 +102,6 @@ int main()
             cout << endl;
         }
     }
+    cout << "Hit rata is:" << (double)(sum_packets - miss_num) / (double)sum_packets << endl;
     return 0;
 }

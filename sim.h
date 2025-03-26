@@ -80,7 +80,8 @@ typedef struct
 typedef enum
 {
     NORMAL,
-    GROWTH_FACTOR
+    GROWTH_FACTOR,
+    STATICTICS
 } Slide_Window_Type;
 
 typedef struct
@@ -219,6 +220,7 @@ DRAM_Addr_Table addr_table[DRAM_ROW_NUM][DRAM_COL_NUM];            // 地址表�
 FlowState flow_states[QUEUE_PER_PORT];                             // 每个流的状态
 double historical_max_rank = 0.0;                                  // 全局变量记录历史最大rank（用于Δ4计算）
 Slide_Window_Type slide_window_type;
+long long miss_num = 0;
 /******************** 工具函数 ​********************/
 // 生成随机来包数/出包数(从BMW-Tree出包)
 int gen_num_enqueue_packets()
@@ -854,7 +856,7 @@ void slide_window_normal(double current_max_rank)
     manage_metadata.Δ1 = manage_metadata.Δ2; // Δ1 ← 旧Δ2
     manage_metadata.Δ2 = manage_metadata.Δ3; // Δ2 ← 旧Δ3
     manage_metadata.Δ3 = manage_metadata.Δ4; // Δ3 ← 旧Δ4
-    manage_metadata.Δ4 += 300.0;
+    manage_metadata.Δ4 += 10.0;
     // 将B区域搬空，搬到SRAM
     if (manage_metadata.last_empty_zone == 1)
     {
@@ -924,7 +926,7 @@ void slide_window_normal(double current_max_rank)
     }
 }
 
-void slide_window_growth(double current_max_rank)
+void slide_window_growth(double current_max_rank, double middle_rank)
 {
     // 1. 阈值向前滑动
     manage_metadata.last_empty_zone = (manage_metadata.last_empty_zone + 1) % 4;
@@ -959,6 +961,108 @@ void slide_window_growth(double current_max_rank)
     }
 }
 
+void slide_window_statistics(double middle_rank, double max_rank)
+{
+    // 1. 阈值向前滑动
+    manage_metadata.last_empty_zone = (manage_metadata.last_empty_zone + 1) % 4;
+    if (manage_metadata.last_empty_zone == 0)
+        manage_metadata.last_empty_zone = 1;
+    if (middle_rank < manage_metadata.Δ1)
+    {
+        manage_metadata.Δ1 = manage_metadata.Δ2; // Δ1 ← 旧Δ2
+        manage_metadata.Δ2 = manage_metadata.Δ3; // Δ2 ← 旧Δ3
+        manage_metadata.Δ3 = manage_metadata.Δ4; // Δ3 ← 旧Δ4
+        manage_metadata.Δ4 = manage_metadata.Δ4 + 30;
+    }
+    else if (middle_rank < manage_metadata.Δ2)
+    {
+        manage_metadata.Δ1 = manage_metadata.Δ2; // Δ1 ← 旧Δ2
+        manage_metadata.Δ2 = manage_metadata.Δ3; // Δ2 ← 旧Δ3
+        manage_metadata.Δ3 = manage_metadata.Δ4; // Δ3 ← 旧Δ4
+        manage_metadata.Δ4 = manage_metadata.Δ4 + 50;
+    }
+    else if (middle_rank < manage_metadata.Δ3)
+    {
+        manage_metadata.Δ1 = manage_metadata.Δ2; // Δ1 ← 旧Δ2
+        manage_metadata.Δ2 = manage_metadata.Δ3; // Δ2 ← 旧Δ3
+        manage_metadata.Δ3 = manage_metadata.Δ4; // Δ3 ← 旧Δ4
+        manage_metadata.Δ4 = manage_metadata.Δ4 + 100;
+    }
+    else
+    {
+        manage_metadata.Δ1 = manage_metadata.Δ2; // Δ1 ← 旧Δ2
+        manage_metadata.Δ2 = manage_metadata.Δ3; // Δ2 ← 旧Δ3
+        manage_metadata.Δ3 = manage_metadata.Δ4; // Δ3 ← 旧Δ4
+        manage_metadata.Δ4 = manage_metadata.Δ4 + 150;
+    }
+    // 将B区域搬空，搬到SRAM
+    if (manage_metadata.last_empty_zone == 1)
+    {
+        manage_metadata.sram_row_addr_block_a = (manage_metadata.sram_row_addr_block_a + 1) % manage_metadata.sram_dram_b_row_addr;
+        manage_metadata.sram_col_offset_block_a = 0;
+        int row_tmp = B_ZONE_OFFSET;
+        int col_tmp = 0;
+        while (row_tmp <= manage_metadata.dram_row_addr_block_b)
+        {
+            for (int i = 1; i <= SRAM_COL_NUM; i++)
+            {
+                int col_tmp_bak = col_tmp;
+                insert_addr(&addr_table[row_tmp][col_tmp], manage_metadata.sram_row_addr_block_a, manage_metadata.sram_col_offset_block_a);
+                SRAM[manage_metadata.sram_row_addr_block_a][(manage_metadata.sram_col_offset_block_a++) % SRAM_COL_NUM] = DRAM[row_tmp][(col_tmp++) % DRAM_COL_NUM];
+                memset(&DRAM[row_tmp][col_tmp_bak], 0, sizeof(Packet));
+            }
+            manage_metadata.sram_row_addr_block_a = (manage_metadata.sram_row_addr_block_a + 1) % manage_metadata.sram_dram_b_row_addr;
+            row_tmp = (row_tmp + 1) % C_ZONE_OFFSET;
+        }
+        manage_metadata.sram_dram_b_col_offset = 0;
+        manage_metadata.dram_row_addr_block_b = B_ZONE_OFFSET;
+        manage_metadata.dram_col_offset_block_b = 0;
+    } // 将C区域搬空，搬到SRAM
+    else if (manage_metadata.last_empty_zone == 2)
+    {
+        manage_metadata.sram_row_addr_block_a = (manage_metadata.sram_row_addr_block_a + 1) % manage_metadata.sram_dram_b_row_addr;
+        manage_metadata.sram_col_offset_block_a = 0;
+        int row_tmp = C_ZONE_OFFSET;
+        int col_tmp = 0;
+        while (row_tmp <= manage_metadata.dram_row_addr_block_c)
+        {
+            for (int i = 1; i <= SRAM_COL_NUM; i++)
+            {
+                int col_tmp_bak = col_tmp;
+                insert_addr(&addr_table[row_tmp][col_tmp], manage_metadata.sram_row_addr_block_a, manage_metadata.sram_col_offset_block_a);
+                SRAM[manage_metadata.sram_row_addr_block_a][(manage_metadata.sram_col_offset_block_a++) % SRAM_COL_NUM] = DRAM[row_tmp][(col_tmp++) % DRAM_COL_NUM];
+                memset(&DRAM[row_tmp][col_tmp_bak], 0, sizeof(Packet));
+            }
+            manage_metadata.sram_row_addr_block_a = (manage_metadata.sram_row_addr_block_a + 1) % manage_metadata.sram_dram_b_row_addr;
+            row_tmp = (row_tmp + 1) % D_ZONE_OFFSET;
+        }
+        manage_metadata.sram_dram_c_col_offset = 0;
+        manage_metadata.dram_row_addr_block_c = C_ZONE_OFFSET;
+        manage_metadata.dram_col_offset_block_c = 0;
+    }
+    else if (manage_metadata.last_empty_zone == 2) // 将D区域搬空，搬到SRAM
+    {
+        manage_metadata.sram_row_addr_block_a = (manage_metadata.sram_row_addr_block_a + 1) % manage_metadata.sram_dram_b_row_addr;
+        manage_metadata.sram_col_offset_block_a = 0;
+        int row_tmp = D_ZONE_OFFSET;
+        int col_tmp = 0;
+        while (row_tmp <= manage_metadata.dram_row_addr_block_d)
+        {
+            for (int i = 1; i <= SRAM_COL_NUM; i++)
+            {
+                int col_tmp_bak = col_tmp;
+                insert_addr(&addr_table[row_tmp][col_tmp], manage_metadata.sram_row_addr_block_a, manage_metadata.sram_col_offset_block_a);
+                SRAM[manage_metadata.sram_row_addr_block_a][(manage_metadata.sram_col_offset_block_a++) % SRAM_COL_NUM] = DRAM[row_tmp][(col_tmp++) % DRAM_COL_NUM];
+                memset(&DRAM[row_tmp][col_tmp_bak], 0, sizeof(Packet));
+            }
+            manage_metadata.sram_row_addr_block_a = (manage_metadata.sram_row_addr_block_a + 1) % manage_metadata.sram_dram_b_row_addr;
+            row_tmp = (row_tmp + 1) % DRAM_ROW_NUM;
+        }
+        manage_metadata.sram_dram_d_col_offset = 0;
+        manage_metadata.dram_row_addr_block_d = D_ZONE_OFFSET;
+        manage_metadata.dram_col_offset_block_d = 0;
+    }
+}
 // 初始化流状态
 void initialize_flow_states()
 {
@@ -1047,7 +1151,7 @@ void update_flow_states(double current_time)
 
 /******************** 调度策略实现 ​********************/
 // WFQ实现
-void wfq_pre_enqueue(Packet *packets[], int num_packets)
+void wfq_pre_enqueue(Packet *packets[], int num_packets, double *middle_rank)
 {
     for (int i = 0; i < num_packets; i++)
     {
@@ -1058,6 +1162,7 @@ void wfq_pre_enqueue(Packet *packets[], int num_packets)
         flow->vir_finish_time = packets[i]->virt_finish;
         packets[i]->rank = packets[i]->virt_finish;
         double rank = packets[i]->rank;
+        *middle_rank += rank;
         max_rank = max_rank > rank ? max_rank : rank;
         // Cache_idx tmp = enqueue_ram(packets[i]->rank, packets[i]);
         // store in SRAM/DRAM,assign addr to pkt
@@ -1067,6 +1172,7 @@ void wfq_pre_enqueue(Packet *packets[], int num_packets)
         printf("Time %.5f:\t flow_%d_Enque (Length: %.3f) (virt_finish/rank:%f)\t (weight:%f)\n",
                (double)virt_time, packets[i]->flow_id, (double)packets[i]->size, (double)packets[i]->virt_finish, (double)((flow->weight)));
     }
+    *middle_rank = *middle_rank / (double)num_packets;
 }
 
 void wfq_post_dequeue(int dequeue_num)
@@ -1090,6 +1196,7 @@ void wfq_post_dequeue(int dequeue_num)
             int idx = find_first_valid(&addr_table[p->row_addr][p->col_addr]);
             if (idx == -1)
             {
+                miss_num++;
                 if (p->flag == 1)
                     cout << "Error:Output Data is dropped by B" << endl;
                 else if (p->flag == 2)
@@ -1103,6 +1210,7 @@ void wfq_post_dequeue(int dequeue_num)
                 int cur_col = addr_table[p->row_addr][p->col_addr].col[idx];
                 // 发送data(这里只是清除)
                 memset(&SRAM[cur_row][cur_col], 0, sizeof(Packet));
+                addr_table[p->row_addr][p->col_addr].e[idx] = false;
             }
         }
     }
