@@ -55,7 +55,7 @@ int main()
         {
             wfq_pre_enqueue(packets, num_enqueue);
         }
-        if (max_rank > manage_metadata.Δ4)
+        if (max_rank > manage_metadata.Δ2 + 50)
         {
             if (SLIDE_WINDOW_TYPE == NORMAL)
             {

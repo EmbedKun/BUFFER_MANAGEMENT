@@ -546,6 +546,8 @@ void enqueue_ram(int rank, Packet *packets)
                 manage_metadata.sram_col_offset_block_a = 0;
                 manage_metadata.sram_row_addr_block_a++;
             }
+            // manage_metadata.ring.ring_tail_row_idx[0] = manage_metadata.sram_row_addr_block_a;
+            // manage_metadata.ring.ring_tail_col_idx[0] = manage_metadata.sram_col_offset_block_a;
         }
         else
         {
@@ -852,7 +854,74 @@ void slide_window_normal(double current_max_rank)
     manage_metadata.Δ1 = manage_metadata.Δ2; // Δ1 ← 旧Δ2
     manage_metadata.Δ2 = manage_metadata.Δ3; // Δ2 ← 旧Δ3
     manage_metadata.Δ3 = manage_metadata.Δ4; // Δ3 ← 旧Δ4
-    manage_metadata.Δ3 += 300.0;
+    manage_metadata.Δ4 += 300.0;
+    // 将B区域搬空，搬到SRAM
+    if (manage_metadata.last_empty_zone == 1)
+    {
+        manage_metadata.sram_row_addr_block_a = (manage_metadata.sram_row_addr_block_a + 1) % manage_metadata.sram_dram_b_row_addr;
+        manage_metadata.sram_col_offset_block_a = 0;
+        int row_tmp = B_ZONE_OFFSET;
+        int col_tmp = 0;
+        while (row_tmp <= manage_metadata.dram_row_addr_block_b)
+        {
+            for (int i = 1; i <= SRAM_COL_NUM; i++)
+            {
+                int col_tmp_bak = col_tmp;
+                insert_addr(&addr_table[row_tmp][col_tmp], manage_metadata.sram_row_addr_block_a, manage_metadata.sram_col_offset_block_a);
+                SRAM[manage_metadata.sram_row_addr_block_a][(manage_metadata.sram_col_offset_block_a++) % SRAM_COL_NUM] = DRAM[row_tmp][(col_tmp++) % DRAM_COL_NUM];
+                memset(&DRAM[row_tmp][col_tmp_bak], 0, sizeof(Packet));
+            }
+            manage_metadata.sram_row_addr_block_a = (manage_metadata.sram_row_addr_block_a + 1) % manage_metadata.sram_dram_b_row_addr;
+            row_tmp = (row_tmp + 1) % C_ZONE_OFFSET;
+        }
+        manage_metadata.sram_dram_b_col_offset = 0;
+        manage_metadata.dram_row_addr_block_b = B_ZONE_OFFSET;
+        manage_metadata.dram_col_offset_block_b = 0;
+    } // 将C区域搬空，搬到SRAM
+    else if (manage_metadata.last_empty_zone == 2)
+    {
+        manage_metadata.sram_row_addr_block_a = (manage_metadata.sram_row_addr_block_a + 1) % manage_metadata.sram_dram_b_row_addr;
+        manage_metadata.sram_col_offset_block_a = 0;
+        int row_tmp = C_ZONE_OFFSET;
+        int col_tmp = 0;
+        while (row_tmp <= manage_metadata.dram_row_addr_block_c)
+        {
+            for (int i = 1; i <= SRAM_COL_NUM; i++)
+            {
+                int col_tmp_bak = col_tmp;
+                insert_addr(&addr_table[row_tmp][col_tmp], manage_metadata.sram_row_addr_block_a, manage_metadata.sram_col_offset_block_a);
+                SRAM[manage_metadata.sram_row_addr_block_a][(manage_metadata.sram_col_offset_block_a++) % SRAM_COL_NUM] = DRAM[row_tmp][(col_tmp++) % DRAM_COL_NUM];
+                memset(&DRAM[row_tmp][col_tmp_bak], 0, sizeof(Packet));
+            }
+            manage_metadata.sram_row_addr_block_a = (manage_metadata.sram_row_addr_block_a + 1) % manage_metadata.sram_dram_b_row_addr;
+            row_tmp = (row_tmp + 1) % D_ZONE_OFFSET;
+        }
+        manage_metadata.sram_dram_c_col_offset = 0;
+        manage_metadata.dram_row_addr_block_c = C_ZONE_OFFSET;
+        manage_metadata.dram_col_offset_block_c = 0;
+    }
+    else if (manage_metadata.last_empty_zone == 2) // 将D区域搬空，搬到SRAM
+    {
+        manage_metadata.sram_row_addr_block_a = (manage_metadata.sram_row_addr_block_a + 1) % manage_metadata.sram_dram_b_row_addr;
+        manage_metadata.sram_col_offset_block_a = 0;
+        int row_tmp = D_ZONE_OFFSET;
+        int col_tmp = 0;
+        while (row_tmp <= manage_metadata.dram_row_addr_block_d)
+        {
+            for (int i = 1; i <= SRAM_COL_NUM; i++)
+            {
+                int col_tmp_bak = col_tmp;
+                insert_addr(&addr_table[row_tmp][col_tmp], manage_metadata.sram_row_addr_block_a, manage_metadata.sram_col_offset_block_a);
+                SRAM[manage_metadata.sram_row_addr_block_a][(manage_metadata.sram_col_offset_block_a++) % SRAM_COL_NUM] = DRAM[row_tmp][(col_tmp++) % DRAM_COL_NUM];
+                memset(&DRAM[row_tmp][col_tmp_bak], 0, sizeof(Packet));
+            }
+            manage_metadata.sram_row_addr_block_a = (manage_metadata.sram_row_addr_block_a + 1) % manage_metadata.sram_dram_b_row_addr;
+            row_tmp = (row_tmp + 1) % DRAM_ROW_NUM;
+        }
+        manage_metadata.sram_dram_d_col_offset = 0;
+        manage_metadata.dram_row_addr_block_d = D_ZONE_OFFSET;
+        manage_metadata.dram_col_offset_block_d = 0;
+    }
 }
 
 void slide_window_growth(double current_max_rank)
