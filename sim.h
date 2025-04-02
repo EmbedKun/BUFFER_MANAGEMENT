@@ -21,15 +21,20 @@ using namespace std;
 const int PORT_COUNT = 1; // 交换机端口数量
 
 /******************** 可配置参数 ​********************/
-#define SLIDE_WINDOW_TYPE NORMAL // 滑动窗口策略
-#define QUEUE_PER_PORT 64        // 每个端口的队列数量
-#define MAX_QUEUE_DEPTH 1024     // 单个队列最大缓存包数
-#define SIMULATION_TIME 10.0     // 仿真时间（秒）
-#define PACKET_RATE 2000.00      // 总包到达速率（包/秒）
-#define SERVICE_RATE 1.2e6       // 服务速率（包/秒）
-#define SCHEDULER_TYPE WFQ       // 调度策略：SP/RR/DRR/WFQ/VC...
+#define SLIDE_WINDOW_TYPE STATICTICS // 滑动窗口策略
+#define QUEUE_PER_PORT 64            // 每个端口的队列数量
+#define MAX_QUEUE_DEPTH 1024         // 单个队列最大缓存包数
+#define SIMULATION_TIME 10.0         // 仿真时间（秒）
+#define PACKET_RATE 2000.00          // 总包到达速率（包/秒）
+#define SERVICE_RATE 1.2e6           // 服务速率（包/秒）
+#define SCHEDULER_TYPE WFQ           // 调度策略：SP/RR/DRR/WFQ/VC...
 #define MAX_PACKETS 1000
 #define N 10
+#define WAITNG_BUFFER_SIZE 1000000
+#define SRAM_READ_PKT_TIME 2
+#define DRAM_READ_PKT_TIME 5
+#define SRAM_WRITE_PKT_TIME 3
+#define DRAM_WRITE_PKT_TIME 10
 
 #define PKT_MAX_SIZE 300  // 包最大有效载荷
 #define SRAM_ROW_NUM 64   // SRAM行数
@@ -38,8 +43,8 @@ const int PORT_COUNT = 1; // 交换机端口数量
 #define DRAM_COL_NUM 16   // DRAM列数
 #define A_ZONE_OFFSET 0   // A区域起始地址相对SRAM的偏移
 int B_ZONE_OFFSET = 0;    // B区域起始地址相对DRAM的偏移(不固定)
-int C_ZONE_OFFSET = 512;  // C区域起始地址相对DRAM的偏移(不固定)
-int D_ZONE_OFFSET = 768;  // D区域起始地址相对DRAM的偏移(不固定)
+int C_ZONE_OFFSET = 342;  // C区域起始地址相对DRAM的偏移(不固定)
+int D_ZONE_OFFSET = 684;  // D区域起始地址相对DRAM的偏移(不固定)
 
 /******************** 数据结构定义 ​********************/
 typedef enum
@@ -221,6 +226,22 @@ FlowState flow_states[QUEUE_PER_PORT];                             // 每个流�
 double historical_max_rank = 0.0;                                  // 全局变量记录历史最大rank（用于Δ4计算）
 Slide_Window_Type slide_window_type;
 long long miss_num = 0;
+long long hit_num = 0;
+
+Packet *SRAM_WRITE_WAITING_BUFFER[WAITNG_BUFFER_SIZE]; // 用于存放将写入SRAM的数据
+Packet *SRAM_READ_WAITING_BUFFER[WAITNG_BUFFER_SIZE];  // 用于存放读出SRAM的数据，时间到了才可释放
+Packet *DRAM_WRITE_WAITING_BUFFER[WAITNG_BUFFER_SIZE];
+Packet *DRAM_READ_WAITING_BUFFER[WAITNG_BUFFER_SIZE];
+// 用于存放时间戳
+int SRAM_WBUFFER_WAITING_TIME[WAITNG_BUFFER_SIZE];
+int SRAM_RBUFFER_WAITING_TIME[WAITNG_BUFFER_SIZE];
+int DRAM_WBUFFER_WAITING_TIME[WAITNG_BUFFER_SIZE];
+int DRAM_RBUFFER_WAITING_TIME[WAITNG_BUFFER_SIZE];
+// 用于存放头指针/下一个插入位置/链表下一个节点的索引
+int sw_buffer_head, sw_buffer_idx;
+int sr_buffer_head, sr_buffer_idx;
+int dw_buffer_head, dw_buffer_idx;
+int dr_buffer_head, dr_buffer_idx;
 /******************** 工具函数 ​********************/
 // 生成随机来包数/出包数(从BMW-Tree出包)
 int gen_num_enqueue_packets()
@@ -246,6 +267,121 @@ int get_random_flow_of_type(const vector<int> &active_flows, FlowType type)
     if (candidates.empty())
         return -1;
     return candidates[rand() % candidates.size()];
+}
+
+// SRAM/DRAM读写阻塞buffer相关函数
+void IN_SW_WAITING_BUFFER(Packet *pkt)
+{
+    SRAM_WRITE_WAITING_BUFFER[sw_buffer_idx] = pkt;
+    SRAM_WBUFFER_WAITING_TIME[sw_buffer_idx++] = SRAM_WRITE_PKT_TIME;
+}
+void IN_SR_WAITING_BUFFER(Packet *pkt)
+{
+    SRAM_READ_WAITING_BUFFER[sr_buffer_idx] = pkt;
+    SRAM_RBUFFER_WAITING_TIME[sr_buffer_idx++] = SRAM_READ_PKT_TIME;
+}
+void IN_DW_WAITING_BUFFER(Packet *pkt)
+{
+    DRAM_WRITE_WAITING_BUFFER[dw_buffer_idx] = pkt;
+    DRAM_WBUFFER_WAITING_TIME[dw_buffer_idx++] = DRAM_WRITE_PKT_TIME;
+}
+void IN_DR_WAITING_BUFFER(Packet *pkt)
+{
+    DRAM_READ_WAITING_BUFFER[dr_buffer_idx++] = pkt;
+    DRAM_RBUFFER_WAITING_TIME[dr_buffer_idx++] = DRAM_READ_PKT_TIME;
+}
+// 每一个cycle调用一次(每一cycle代表前进1ns)
+void time_move()
+{
+    int sw_buffer_head_2, sr_buffer_head_2, dw_buffer_head_2, dr_buffer_head_2;
+    // 找到最近时间戳的一组包
+    for (int i = sw_buffer_head; i < N && (SRAM_WBUFFER_WAITING_TIME[sw_buffer_head] == SRAM_WBUFFER_WAITING_TIME[i]) && SRAM_WBUFFER_WAITING_TIME[i] != 0 && SRAM_WBUFFER_WAITING_TIME[i] != 0xFFFFFFFF;)
+    {
+        sw_buffer_head_2 = ++i;
+    }
+    for (int i = sr_buffer_head; i < N && (SRAM_RBUFFER_WAITING_TIME[sr_buffer_head] == SRAM_RBUFFER_WAITING_TIME[i]) && SRAM_RBUFFER_WAITING_TIME[i] != 0 && SRAM_RBUFFER_WAITING_TIME[i] != 0xFFFFFFFF;)
+    {
+        sr_buffer_head_2 = ++i;
+    }
+    for (int i = dw_buffer_head; i < N && (DRAM_WBUFFER_WAITING_TIME[dw_buffer_head] == DRAM_WBUFFER_WAITING_TIME[i]) && DRAM_WBUFFER_WAITING_TIME[i] != 0 && SRAM_RBUFFER_WAITING_TIME[i] != 0xFFFFFFFF;)
+    {
+        dw_buffer_head_2 = ++i;
+    }
+    for (int i = dr_buffer_head; i < N && (DRAM_RBUFFER_WAITING_TIME[dr_buffer_head] == DRAM_RBUFFER_WAITING_TIME[i]) && DRAM_RBUFFER_WAITING_TIME[i] != 0 && SRAM_RBUFFER_WAITING_TIME[i] != 0xFFFFFFFF;)
+    {
+        dr_buffer_head_2 = ++i;
+    }
+    // 将此组包的计时器减一
+    for (int i = sw_buffer_head; i < sw_buffer_head_2; i++)
+    {
+        if (SRAM_WBUFFER_WAITING_TIME[i] > 0)
+            SRAM_WBUFFER_WAITING_TIME[i]--;
+    }
+    for (int i = sr_buffer_head; i < sr_buffer_head_2; i++)
+    {
+        if (SRAM_RBUFFER_WAITING_TIME[i] > 0)
+            SRAM_RBUFFER_WAITING_TIME[i]--;
+    }
+    for (int i = dw_buffer_head; i < dw_buffer_head_2; i++)
+    {
+        if (DRAM_WBUFFER_WAITING_TIME[i] > 0)
+            DRAM_WBUFFER_WAITING_TIME[i]--;
+    }
+    for (int i = dr_buffer_head; i < dr_buffer_head_2; i++)
+    {
+        if (DRAM_RBUFFER_WAITING_TIME[i] > 0)
+            DRAM_RBUFFER_WAITING_TIME[i]--;
+    }
+}
+
+bool OUT_SW_WAITING_BUFFER(Packet *pkt)
+{
+    if (SRAM_WBUFFER_WAITING_TIME[sw_buffer_head] == 0)
+    {
+        pkt = SRAM_WRITE_WAITING_BUFFER[sw_buffer_head++];
+    }
+    else
+    {
+        return false;
+    }
+    return true;
+}
+
+bool OUT_SR_WAITING_BUFFER(Packet *pkt)
+{
+    if (SRAM_RBUFFER_WAITING_TIME[sr_buffer_head] == 0)
+    {
+        pkt = SRAM_READ_WAITING_BUFFER[sr_buffer_head++];
+    }
+    else
+    {
+        return false;
+    }
+    return true;
+}
+bool OUT_DW_WAITING_BUFFER(Packet *pkt)
+{
+    if (DRAM_WBUFFER_WAITING_TIME[dw_buffer_head] == 0)
+    {
+        pkt = DRAM_WRITE_WAITING_BUFFER[dw_buffer_head++];
+    }
+    else
+    {
+        return false;
+    }
+    return true;
+}
+bool OUT_DR_WAITING_BUFFER(Packet *pkt)
+{
+    if (DRAM_RBUFFER_WAITING_TIME[dr_buffer_head] == 0)
+    {
+        pkt = DRAM_READ_WAITING_BUFFER[dr_buffer_head++];
+    }
+    else
+    {
+        return false;
+    }
+    return true;
 }
 
 // 生成随机enqueue包所属流
@@ -565,6 +701,7 @@ void enqueue_ram(int rank, Packet *packets)
             packets->flag = 1;
             packets->row_addr = manage_metadata.dram_row_addr_block_b, packets->col_addr = manage_metadata.dram_col_offset_block_b++;
             SRAM[manage_metadata.sram_dram_b_row_addr][manage_metadata.sram_dram_b_col_offset++] = *packets;
+            DRAM[manage_metadata.dram_row_addr_block_b][(manage_metadata.dram_col_offset_block_b - 1) % 16] = *packets;
             if (manage_metadata.sram_dram_b_col_offset == SRAM_COL_NUM)
             {
                 manage_metadata.sram_dram_b_col_offset = 0;
@@ -588,6 +725,7 @@ void enqueue_ram(int rank, Packet *packets)
             packets->flag = 2;
             packets->row_addr = manage_metadata.dram_row_addr_block_c, packets->col_addr = manage_metadata.dram_col_offset_block_c++;
             SRAM[manage_metadata.sram_dram_c_row_addr][manage_metadata.sram_dram_c_col_offset++] = *packets;
+            DRAM[manage_metadata.dram_row_addr_block_c][(manage_metadata.dram_col_offset_block_c - 1) % 16] = *packets;
             if (manage_metadata.sram_dram_c_col_offset == SRAM_COL_NUM)
             {
                 manage_metadata.sram_dram_c_col_offset = 0;
@@ -611,6 +749,7 @@ void enqueue_ram(int rank, Packet *packets)
             packets->flag = 3;
             packets->row_addr = manage_metadata.dram_row_addr_block_d, packets->col_addr = manage_metadata.dram_col_offset_block_d++;
             SRAM[manage_metadata.sram_dram_d_row_addr][manage_metadata.sram_dram_d_col_offset++] = *packets;
+            DRAM[manage_metadata.dram_row_addr_block_d][(manage_metadata.dram_col_offset_block_d - 1) % 16] = *packets;
             if (manage_metadata.sram_dram_d_col_offset == SRAM_COL_NUM)
             {
                 manage_metadata.sram_dram_d_col_offset = 0;
@@ -634,6 +773,7 @@ void enqueue_ram(int rank, Packet *packets)
             packets->flag = 1;
             packets->row_addr = manage_metadata.dram_row_addr_block_b, packets->col_addr = manage_metadata.dram_col_offset_block_b++;
             SRAM[manage_metadata.sram_dram_b_row_addr][manage_metadata.sram_dram_b_col_offset++] = *packets;
+            DRAM[manage_metadata.dram_row_addr_block_b][(manage_metadata.dram_col_offset_block_b - 1) % 16] = *packets;
             if (manage_metadata.sram_dram_b_col_offset == SRAM_COL_NUM)
             {
                 manage_metadata.sram_dram_b_col_offset = 0;
@@ -660,6 +800,7 @@ void enqueue_ram(int rank, Packet *packets)
             packets->flag = 2;
             packets->row_addr = manage_metadata.dram_row_addr_block_c, packets->col_addr = manage_metadata.dram_col_offset_block_c++;
             SRAM[manage_metadata.sram_dram_c_row_addr][manage_metadata.sram_dram_c_col_offset++] = *packets;
+            DRAM[manage_metadata.dram_row_addr_block_c][(manage_metadata.dram_col_offset_block_c - 1) % 16] = *packets;
             if (manage_metadata.sram_dram_c_col_offset == SRAM_COL_NUM)
             {
                 manage_metadata.sram_dram_c_col_offset = 0;
@@ -683,6 +824,7 @@ void enqueue_ram(int rank, Packet *packets)
             packets->flag = 3;
             packets->row_addr = manage_metadata.dram_row_addr_block_d, packets->col_addr = manage_metadata.dram_col_offset_block_d++;
             SRAM[manage_metadata.sram_dram_d_row_addr][manage_metadata.sram_dram_d_col_offset++] = *packets;
+            DRAM[manage_metadata.dram_row_addr_block_d][(manage_metadata.dram_col_offset_block_d - 1) % 16] = *packets;
             if (manage_metadata.sram_dram_d_col_offset == SRAM_COL_NUM)
             {
                 manage_metadata.sram_dram_d_col_offset = 0;
@@ -706,6 +848,7 @@ void enqueue_ram(int rank, Packet *packets)
             packets->flag = 1;
             packets->row_addr = manage_metadata.dram_row_addr_block_b, packets->col_addr = manage_metadata.dram_col_offset_block_b++;
             SRAM[manage_metadata.sram_dram_b_row_addr][manage_metadata.sram_dram_b_col_offset++] = *packets;
+            DRAM[manage_metadata.dram_row_addr_block_b][(manage_metadata.dram_col_offset_block_b - 1) % 16] = *packets;
             if (manage_metadata.sram_dram_b_col_offset == SRAM_COL_NUM)
             {
                 manage_metadata.sram_dram_b_col_offset = 0;
@@ -729,6 +872,7 @@ void enqueue_ram(int rank, Packet *packets)
             packets->flag = 2;
             packets->row_addr = manage_metadata.dram_row_addr_block_c, packets->col_addr = manage_metadata.dram_col_offset_block_c++;
             SRAM[manage_metadata.sram_dram_c_row_addr][manage_metadata.sram_dram_c_col_offset++] = *packets;
+            DRAM[manage_metadata.dram_row_addr_block_c][(manage_metadata.dram_col_offset_block_c - 1) % 16] = *packets;
             if (manage_metadata.sram_dram_c_col_offset == SRAM_COL_NUM)
             {
                 manage_metadata.sram_dram_c_col_offset = 0;
@@ -748,13 +892,14 @@ void enqueue_ram(int rank, Packet *packets)
             }
         }
     }
-    else if (rank <= manage_metadata.Δ4)
+    else
     {
         if (manage_metadata.last_empty_zone == 0)
         {
             packets->flag = 3;
             packets->row_addr = manage_metadata.dram_row_addr_block_d, packets->col_addr = manage_metadata.dram_col_offset_block_d++;
             SRAM[manage_metadata.sram_dram_d_row_addr][manage_metadata.sram_dram_d_col_offset++] = *packets;
+            DRAM[manage_metadata.dram_row_addr_block_d][(manage_metadata.dram_col_offset_block_d - 1) % 16] = *packets;
             if (manage_metadata.sram_dram_d_col_offset == SRAM_COL_NUM)
             {
                 manage_metadata.sram_dram_d_col_offset = 0;
@@ -778,6 +923,7 @@ void enqueue_ram(int rank, Packet *packets)
             packets->flag = 1;
             packets->row_addr = manage_metadata.dram_row_addr_block_b, packets->col_addr = manage_metadata.dram_col_offset_block_b++;
             SRAM[manage_metadata.sram_dram_b_row_addr][manage_metadata.sram_dram_b_col_offset++] = *packets;
+            DRAM[manage_metadata.dram_row_addr_block_b][(manage_metadata.dram_col_offset_block_b - 1) % 16] = *packets;
             if (manage_metadata.sram_dram_b_col_offset == SRAM_COL_NUM)
             {
                 manage_metadata.sram_dram_b_col_offset = 0;
@@ -796,51 +942,53 @@ void enqueue_ram(int rank, Packet *packets)
                 manage_metadata.dram_col_offset_block_b = 0;
             }
         }
-    }
-    else if (manage_metadata.last_empty_zone == 2)
-    {
-        packets->flag = 2;
-        packets->row_addr = manage_metadata.dram_row_addr_block_c, packets->col_addr = manage_metadata.dram_col_offset_block_c++;
-        SRAM[manage_metadata.sram_dram_c_row_addr][manage_metadata.sram_dram_c_col_offset++] = *packets;
-        if (manage_metadata.sram_dram_c_col_offset == SRAM_COL_NUM)
+        else if (manage_metadata.last_empty_zone == 2)
         {
-            manage_metadata.sram_dram_c_col_offset = 0;
-            manage_metadata.dram_col_offset_block_c = 0;
-            for (int i = 0; i < SRAM_COL_NUM; i++)
+            packets->flag = 2;
+            packets->row_addr = manage_metadata.dram_row_addr_block_c, packets->col_addr = manage_metadata.dram_col_offset_block_c++;
+            SRAM[manage_metadata.sram_dram_c_row_addr][manage_metadata.sram_dram_c_col_offset++] = *packets;
+            DRAM[manage_metadata.dram_row_addr_block_c][(manage_metadata.dram_col_offset_block_c - 1) % 16] = *packets;
+            if (manage_metadata.sram_dram_c_col_offset == SRAM_COL_NUM)
             {
-                DRAM[manage_metadata.dram_row_addr_block_c][manage_metadata.dram_col_offset_block_c++] = SRAM[manage_metadata.sram_dram_c_row_addr][i];
+                manage_metadata.sram_dram_c_col_offset = 0;
+                manage_metadata.dram_col_offset_block_c = 0;
+                for (int i = 0; i < SRAM_COL_NUM; i++)
+                {
+                    DRAM[manage_metadata.dram_row_addr_block_c][manage_metadata.dram_col_offset_block_c++] = SRAM[manage_metadata.sram_dram_c_row_addr][i];
+                }
+                manage_metadata.dram_row_addr_block_c++;
+                manage_metadata.dram_col_offset_block_c = 0;
             }
-            manage_metadata.dram_row_addr_block_c++;
-            manage_metadata.dram_col_offset_block_c = 0;
-        }
-        if (manage_metadata.dram_row_addr_block_c >= D_ZONE_OFFSET)
-        {
-            cout << "Error:Zone-C is full" << endl;
-            manage_metadata.dram_row_addr_block_c = C_ZONE_OFFSET;
-            manage_metadata.dram_col_offset_block_c = 0;
-        }
-    }
-    else if (manage_metadata.last_empty_zone == 3)
-    {
-        packets->flag = 3;
-        packets->row_addr = manage_metadata.dram_row_addr_block_d, packets->col_addr = manage_metadata.dram_col_offset_block_d++;
-        SRAM[manage_metadata.sram_dram_d_row_addr][manage_metadata.sram_dram_d_col_offset++] = *packets;
-        if (manage_metadata.sram_dram_d_col_offset == SRAM_COL_NUM)
-        {
-            manage_metadata.sram_dram_d_col_offset = 0;
-            manage_metadata.dram_col_offset_block_d = 0;
-            for (int i = 0; i < SRAM_COL_NUM; i++)
+            if (manage_metadata.dram_row_addr_block_c >= D_ZONE_OFFSET)
             {
-                DRAM[manage_metadata.dram_row_addr_block_d][manage_metadata.dram_col_offset_block_d++] = SRAM[manage_metadata.sram_dram_d_row_addr][i];
+                cout << "Error:Zone-C is full" << endl;
+                manage_metadata.dram_row_addr_block_c = C_ZONE_OFFSET;
+                manage_metadata.dram_col_offset_block_c = 0;
             }
-            manage_metadata.dram_row_addr_block_d++;
-            manage_metadata.dram_col_offset_block_d = 0;
         }
-        if (manage_metadata.dram_row_addr_block_d >= DRAM_ROW_NUM)
+        else if (manage_metadata.last_empty_zone == 3)
         {
-            cout << "Error:Zone-D is full" << endl;
-            manage_metadata.dram_row_addr_block_d = D_ZONE_OFFSET;
-            manage_metadata.dram_col_offset_block_d = 0;
+            packets->flag = 3;
+            packets->row_addr = manage_metadata.dram_row_addr_block_d, packets->col_addr = manage_metadata.dram_col_offset_block_d++;
+            SRAM[manage_metadata.sram_dram_d_row_addr][manage_metadata.sram_dram_d_col_offset++] = *packets;
+            DRAM[manage_metadata.dram_row_addr_block_d][(manage_metadata.dram_col_offset_block_d - 1) % 16] = *packets;
+            if (manage_metadata.sram_dram_d_col_offset == SRAM_COL_NUM)
+            {
+                manage_metadata.sram_dram_d_col_offset = 0;
+                manage_metadata.dram_col_offset_block_d = 0;
+                for (int i = 0; i < SRAM_COL_NUM; i++)
+                {
+                    DRAM[manage_metadata.dram_row_addr_block_d][manage_metadata.dram_col_offset_block_d++] = SRAM[manage_metadata.sram_dram_d_row_addr][i];
+                }
+                manage_metadata.dram_row_addr_block_d++;
+                manage_metadata.dram_col_offset_block_d = 0;
+            }
+            if (manage_metadata.dram_row_addr_block_d >= DRAM_ROW_NUM)
+            {
+                cout << "Error:Zone-D is full" << endl;
+                manage_metadata.dram_row_addr_block_d = D_ZONE_OFFSET;
+                manage_metadata.dram_col_offset_block_d = 0;
+            }
         }
     }
 }
@@ -856,7 +1004,7 @@ void slide_window_normal(double current_max_rank)
     manage_metadata.Δ1 = manage_metadata.Δ2; // Δ1 ← 旧Δ2
     manage_metadata.Δ2 = manage_metadata.Δ3; // Δ2 ← 旧Δ3
     manage_metadata.Δ3 = manage_metadata.Δ4; // Δ3 ← 旧Δ4
-    manage_metadata.Δ4 += 10.0;
+    manage_metadata.Δ4 += 700.0;
     // 将B区域搬空，搬到SRAM
     if (manage_metadata.last_empty_zone == 1)
     {
@@ -1189,6 +1337,7 @@ void wfq_post_dequeue(int dequeue_num)
         if (p->flag == 0)
         {
             memset(&SRAM[p->row_addr][p->col_addr], 0, sizeof(Packet));
+            hit_num++;
             // 发送data
         }
         else if (p->flag != 0)
@@ -1206,6 +1355,7 @@ void wfq_post_dequeue(int dequeue_num)
             }
             else
             {
+                hit_num++;
                 int cur_row = addr_table[p->row_addr][p->col_addr].row[idx];
                 int cur_col = addr_table[p->row_addr][p->col_addr].col[idx];
                 // 发送data(这里只是清除)

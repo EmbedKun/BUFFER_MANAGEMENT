@@ -6,8 +6,10 @@ int main()
     q->size = 0; // 硬件堆中现有0个包
     long long sum_packets = 0;
     srand(time(0));
-    manage_metadata.Δ1 = 50.0, manage_metadata.Δ2 = 100.0, manage_metadata.Δ3 = 150.0, manage_metadata.Δ4 = 300.0; // 初始化Δ
-    initialize_memory();                                                                                           // 初始化SRAM和DRAM
+    // manage_metadata.Δ1 = 50000.0, manage_metadata.Δ2 = 100000.0, manage_metadata.Δ3 = 150000.0, manage_metadata.Δ4 = 300000.0; // 初始化Δ
+    manage_metadata.Δ1 = 300.0, manage_metadata.Δ2 = 700.0, manage_metadata.Δ3 = 1000.0, manage_metadata.Δ4 = 1500.0; // 初始化Δ
+
+    initialize_memory(); // 初始化SRAM和DRAM
     init_flow_weight();
     initialize_flow_states();
     // 打开输出文件并重定向cout
@@ -42,7 +44,9 @@ int main()
         {
             int flow_id = gen_flow_id();
             if (flow_id == -1)
+            {
                 flow_id = rand() % (9 - 1) + 1;
+            }
             double size = (double)((rand() % (300 - 50 + 1)) + 50) + (double)(1.0 / (double)rand());
             test_packets[i].arrival_time = num_cycles;
             test_packets[i].size = size;
@@ -61,7 +65,7 @@ int main()
 
         if (SLIDE_WINDOW_TYPE == NORMAL)
         {
-            if (max_rank > manage_metadata.Δ2 + 50)
+            if (max_rank > manage_metadata.Δ1 + 100.0)
             {
                 slide_window_normal(max_rank);
             }
@@ -72,9 +76,18 @@ int main()
         }
         else if (SLIDE_WINDOW_TYPE == STATICTICS)
         {
-            if (max_rank > manage_metadata.Δ4 + 100)
+            int empty_bak;
+            for (int i = 0; i < SRAM_ROW_NUM; i++)
             {
-                slide_window_statistics(middle_rank, max_rank);
+                for (int j = 0; j < SRAM_COL_NUM; j++)
+                {
+                    if (SRAM[i][j].rank < 1.0)
+                        empty_bak += 1.0;
+                }
+            }
+            if ((empty_bak > 500 && num_cycles < 900) || max_rank > manage_metadata.Δ1 + 300.0)
+            {
+                slide_window_normal(max_rank);
             }
         }
 
@@ -102,6 +115,17 @@ int main()
             cout << endl;
         }
     }
-    cout << "Hit rata is:" << (double)(sum_packets - miss_num) / (double)sum_packets << endl;
+    cout << "Hit rata is:" << (double)(hit_num) / (double)sum_packets << endl;
+    double num_empty;
+    for (int i = 0; i < SRAM_ROW_NUM; i++)
+    {
+        for (int j = 0; j < SRAM_COL_NUM; j++)
+        {
+            if (SRAM[i][j].rank < 1.0)
+                num_empty += 1.0;
+        }
+    }
+    // printf("%.5f\n", num_empty / 1024.0);
+    cout << "SRAM rata is:" << 2.0 * (num_empty / 1024.0) << endl;
     return 0;
 }
